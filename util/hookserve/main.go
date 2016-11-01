@@ -3,9 +3,10 @@ package main
 import (
 	"fmt"
 	"github.com/codegangsta/cli"
-	"github.com/phayes/hookserve/hookserve"
+	"github.com/reyoung/hookserve/hookserve"
 	"os"
 	"os/exec"
+	"github.com/bmatsuo/go-jsontree"
 )
 
 func main() {
@@ -42,19 +43,30 @@ func main() {
 		server.Port = c.Int("port")
 		server.Secret = c.String("secret")
 		server.IgnoreTags = !c.Bool("tags")
+		server.CustomEventHandler["ping"] = func(*jsontree.JsonTree)(interface{}, error) {
+			return "pong", nil
+		}
 		server.GoListenAndServe()
 
-		for commit := range server.Events {
-			if args := c.Args(); len(args) != 0 {
+		for event := range server.Events {
+			switch event.(type) {
+			case hookserve.Event:
+				commit := event.(hookserve.Event)
+				if args := c.Args(); len(args) != 0 {
 				root := args[0]
 				rest := append(args[1:], commit.Owner, commit.Repo, commit.Branch, commit.Commit)
 				cmd := exec.Command(root, rest...)
 				cmd.Stdout = os.Stdout
 				cmd.Stderr = os.Stderr
 				cmd.Run()
-			} else {
-				fmt.Println(commit.Owner + " " + commit.Repo + " " + commit.Branch + " " + commit.Commit)
+				} else {
+					fmt.Println(commit.Owner + " " + commit.Repo + " " + commit.Branch + " " + commit.Commit)
+				}
+			case string:
+				fmt.Println(event.(string))
 			}
+
+
 		}
 	}
 

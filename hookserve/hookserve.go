@@ -4,15 +4,12 @@ import (
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/hex"
-	"errors"
 	"github.com/bmatsuo/go-jsontree"
 	"io/ioutil"
 	"net/http"
 	"strconv"
-	"strings"
+	"log"
 )
-
-var ErrInvalidEventFormat = errors.New("Unable to parse event string. Invalid Format.")
 
 type Event struct {
 	Owner      string // The username of the owner of the repository
@@ -26,74 +23,13 @@ type Event struct {
 	BaseBranch string // For Pull Requests, contains the base branch
 }
 
-// Create a new event from a string, the string format being the same as the one produced by event.String()
-func NewEvent(e string) (*Event, error) {
-	// Trim whitespace
-	e = strings.Trim(e, "\n\t ")
-
-	// Split into lines
-	parts := strings.Split(e, "\n")
-
-	// Sanity checking
-	if len(parts) != 5 || len(parts) != 8 {
-		return nil, ErrInvalidEventFormat
-	}
-	for _, item := range parts {
-		if len(item) < 8 {
-			return nil, ErrInvalidEventFormat
-		}
-	}
-
-	// Fill in values for the event
-	event := Event{}
-	event.Type = parts[0][8:]
-	event.Owner = parts[1][8:]
-	event.Repo = parts[2][8:]
-	event.Branch = parts[3][8:]
-	event.Commit = parts[4][8:]
-
-	// Fill in extra values if it's a pull_request
-	if event.Type == "pull_request" {
-		if len(parts) == 9 { // New format
-			event.Action = parts[5][8:]
-			event.BaseOwner = parts[6][8:]
-			event.BaseRepo = parts[7][8:]
-			event.BaseBranch = parts[8][8:]
-		} else if len(parts) == 8 { // Old Format
-			event.BaseOwner = parts[5][8:]
-			event.BaseRepo = parts[6][8:]
-			event.BaseBranch = parts[7][8:]
-		} else {
-			return nil, ErrInvalidEventFormat
-		}
-	}
-
-	return &event, nil
-}
-
-func (e *Event) String() (output string) {
-	output += "type:   " + e.Type + "\n"
-	output += "owner:  " + e.Owner + "\n"
-	output += "repo:   " + e.Repo + "\n"
-	output += "branch: " + e.Branch + "\n"
-	output += "commit: " + e.Commit + "\n"
-
-	if e.Type == "pull_request" {
-		output += "action: " + e.Action + "\n"
-		output += "bowner: " + e.BaseOwner + "\n"
-		output += "brepo:  " + e.BaseRepo + "\n"
-		output += "bbranch:" + e.BaseBranch + "\n"
-	}
-
-	return
-}
-
 type Server struct {
 	Port       int        // Port to listen on. Defaults to 80
 	Path       string     // Path to receive on. Defaults to "/postreceive"
 	Secret     string     // Option secret key for authenticating via HMAC
 	IgnoreTags bool       // If set to false, also execute command if tag is pushed
-	Events     chan Event // Channel of events. Read from this channel to get push events as they happen.
+	Events     chan interface{} // Channel of events.
+	CustomEventHandler map[string] func (*jsontree.JsonTree) (interface {}, error)
 }
 
 // Create a new server with sensible defaults.
@@ -103,7 +39,8 @@ func NewServer() *Server {
 		Port:       80,
 		Path:       "/postreceive",
 		IgnoreTags: true,
-		Events:     make(chan Event, 10), // buffered to 10 items
+		Events:     make(chan interface{}, 10), // buffered to 10 items
+		CustomEventHandler: make(map[string]func(*jsontree.JsonTree)(interface{}, error)),
 	}
 }
 
@@ -188,8 +125,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// Parse the request and build the Event
-	event := Event{}
 
+	var ev interface{} = nil
 	if eventType == "push" {
 		rawRef, err := request.Get("ref").String()
 		if err != nil {
@@ -200,7 +137,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		if s.ignoreRef(rawRef) || request.Get("head_commit").IsNull() {
 			return
 		}
-
+		event := Event{}
 		// Fill in values
 		event.Type = eventType
 		event.Branch = rawRef[11:]
@@ -219,7 +156,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		ev = event
 	} else if eventType == "pull_request" {
+		event := Event{}
 		event.Action, err = request.Get("action").String()
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -263,15 +202,26 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		ev = event
 	} else {
-		http.Error(w, "Unknown Event Type "+eventType, http.StatusInternalServerError)
-		return
+		log.Println(eventType)
+		handler, ok := s.CustomEventHandler[eventType]
+		if !ok {
+			http.Error(w, "Unknown Event Type " + eventType, http.StatusInternalServerError)
+			return
+		} else {
+			ev, err = handler(request)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
 	}
 
 	// We've built our Event - put it into the channel and we're done
 	go func() {
-		s.Events <- event
+		s.Events <- ev
 	}()
 
-	w.Write([]byte(event.String()))
+	w.Write([]byte(string("ok")))
 }
