@@ -8,7 +8,6 @@ import (
 	"io/ioutil"
 	"net/http"
 	"strconv"
-	"log"
 )
 
 type Event struct {
@@ -85,10 +84,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	eventType := req.Header.Get("X-GitHub-Event")
 	if eventType == "" {
 		http.Error(w, "400 Bad Request - Missing X-GitHub-Event Header", http.StatusBadRequest)
-		return
-	}
-	if eventType != "push" && eventType != "pull_request" {
-		http.Error(w, "400 Bad Request - Unknown Event Type "+eventType, http.StatusBadRequest)
 		return
 	}
 
@@ -204,7 +199,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		ev = event
 	} else {
-		log.Println(eventType)
 		handler, ok := s.CustomEventHandler[eventType]
 		if !ok {
 			http.Error(w, "Unknown Event Type " + eventType, http.StatusInternalServerError)
