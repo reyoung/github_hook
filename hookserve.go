@@ -1,4 +1,4 @@
-package hookserve
+package github_hook
 
 import (
 	"crypto/hmac"
@@ -10,25 +10,14 @@ import (
 	"strconv"
 )
 
-type Event struct {
-	Owner      string // The username of the owner of the repository
-	Repo       string // The name of the repository
-	Branch     string // The branch the event took place on
-	Commit     string // The head commit hash attached to the event
-	Type       string // Can be either "pull_request" or "push"
-	Action     string // For Pull Requests, contains "assigned", "unassigned", "labeled", "unlabeled", "opened", "closed", "reopened", or "synchronize".
-	BaseOwner  string // For Pull Requests, contains the base owner
-	BaseRepo   string // For Pull Requests, contains the base repo
-	BaseBranch string // For Pull Requests, contains the base branch
-}
 
 type Server struct {
-	Port       int        // Port to listen on. Defaults to 80
-	Path       string     // Path to receive on. Defaults to "/postreceive"
-	Secret     string     // Option secret key for authenticating via HMAC
-	IgnoreTags bool       // If set to false, also execute command if tag is pushed
-	Events     chan interface{} // Channel of events.
-	CustomEventHandler map[string] func (*jsontree.JsonTree) (interface {}, error)
+	Port         int        // Port to listen on. Defaults to 80
+	Path         string     // Path to receive on. Defaults to "/postreceive"
+	Secret       string     // Option secret key for authenticating via HMAC
+	IgnoreTags   bool       // If set to false, also execute command if tag is pushed
+	Events       chan interface{} // Channel of events.
+	EventHandler map[string] func (*jsontree.JsonTree) (interface {}, error)
 }
 
 // Create a new server with sensible defaults.
@@ -39,7 +28,7 @@ func NewServer() *Server {
 		Path:       "/postreceive",
 		IgnoreTags: true,
 		Events:     make(chan interface{}, 10), // buffered to 10 items
-		CustomEventHandler: make(map[string]func(*jsontree.JsonTree)(interface{}, error)),
+		EventHandler: make(map[string]func(*jsontree.JsonTree)(interface{}, error)),
 	}
 }
 
@@ -58,13 +47,6 @@ func (s *Server) GoListenAndServe() {
 	}()
 }
 
-// Checks if the given ref should be ignored
-func (s *Server) ignoreRef(rawRef string) bool {
-	if rawRef[:10] == "refs/tags/" && !s.IgnoreTags {
-		return false
-	}
-	return rawRef[:11] != "refs/heads/"
-}
 
 // Satisfies the http.Handler interface.
 // Instead of calling Server.ListenAndServe you can integrate hookserve.Server inside your own http server.
@@ -119,103 +101,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Parse the request and build the Event
-
-	var ev interface{} = nil
-	if eventType == "push" {
-		rawRef, err := request.Get("ref").String()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		// If the ref is not a branch, we don't care about it
-		if s.ignoreRef(rawRef) || request.Get("head_commit").IsNull() {
-			return
-		}
-		event := Event{}
-		// Fill in values
-		event.Type = eventType
-		event.Branch = rawRef[11:]
-		event.Repo, err = request.Get("repository").Get("name").String()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		event.Commit, err = request.Get("head_commit").Get("id").String()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		event.Owner, err = request.Get("repository").Get("owner").Get("name").String()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		ev = event
-	} else if eventType == "pull_request" {
-		event := Event{}
-		event.Action, err = request.Get("action").String()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		// Fill in values
-		event.Type = eventType
-		event.Owner, err = request.Get("pull_request").Get("head").Get("repo").Get("owner").Get("login").String()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		event.Repo, err = request.Get("pull_request").Get("head").Get("repo").Get("name").String()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		event.Branch, err = request.Get("pull_request").Get("head").Get("ref").String()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		event.Commit, err = request.Get("pull_request").Get("head").Get("sha").String()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		event.BaseOwner, err = request.Get("pull_request").Get("base").Get("repo").Get("owner").Get("login").String()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		event.BaseRepo, err = request.Get("pull_request").Get("base").Get("repo").Get("name").String()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		event.BaseBranch, err = request.Get("pull_request").Get("base").Get("ref").String()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		ev = event
+	handler, ok := s.EventHandler[eventType]
+	if !ok {
+		http.Error(w, "Unknown Event Type " + eventType, http.StatusInternalServerError)
+		return
 	} else {
-		handler, ok := s.CustomEventHandler[eventType]
-		if !ok {
-			http.Error(w, "Unknown Event Type " + eventType, http.StatusInternalServerError)
+		ev, err := handler(request)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
-		} else {
-			ev, err = handler(request)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
 		}
+		// We've built our Event - put it into the channel and we're done
+		go func() {
+			s.Events <- ev
+		}()
 	}
-
-	// We've built our Event - put it into the channel and we're done
-	go func() {
-		s.Events <- ev
-	}()
 
 	w.Write([]byte(string("ok")))
 }
